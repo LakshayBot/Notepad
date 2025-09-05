@@ -1,0 +1,267 @@
+from scrapling.fetchers import StealthyFetcher, AsyncStealthySession, DynamicFetcher
+from scrapling.parser import Selector
+import json
+import asyncio
+import re
+
+async def get_video_urls_async(post_urls, max_tabs=5):
+    """
+    Extract video URLs using AsyncStealthySession with tab-based concurrency
+    """
+    video_urls = {}
+    
+    async with AsyncStealthySession(headless=True, solve_cloudflare=True) as session:
+        # Create semaphore to limit concurrent tabs
+        semaphore = asyncio.Semaphore(max_tabs)
+        
+        # Create tasks for all URLs with semaphore control
+        tasks = []
+        for url in post_urls:
+            tasks.append(fetch_single_video_url_with_semaphore(session, url, semaphore))
+        
+        # Execute all tasks concurrently
+        print(f"Processing {len(post_urls)} video URLs with {max_tabs} concurrent tabs...")
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Process results
+        for i, result in enumerate(results):
+            url = post_urls[i]
+            if isinstance(result, Exception):
+                print(f"Error fetching video for {url}: {result}")
+                video_urls[url] = ''
+            else:
+                video_urls[url] = result
+                if result:
+                    print(f"Found video URL for {url}: {result}")
+                else:
+                    print(f"No video URL found for {url}")
+    
+    return video_urls
+
+async def fetch_single_video_url_with_semaphore(session, url, semaphore):
+    """
+    Wrapper to control concurrency with semaphore
+    """
+    async with semaphore:
+        return await fetch_single_video_url(session, url)
+
+async def fetch_single_video_url(session, url):
+    """
+    Fetch video URL for a single post using the existing session
+    """
+    try:
+        # Extract post ID from URL for pattern matching
+        post_id_match = re.search(r'/post/([a-f0-9]+)\.html', url)
+        if not post_id_match:
+            return ''
+        post_id = post_id_match.group(1)
+        
+        # Add a small delay to avoid overwhelming the server
+        await asyncio.sleep(0.1)
+        
+        # Fetch the post page using the existing session
+        page = await session.fetch(url)
+        html = page.body
+        parsed = Selector(html)
+        
+        # Look for video elements and sources
+        video_url = ''
+        
+        # Check for video elements with src attributes
+        videos = parsed.css('video')
+        for video in videos:
+            src = video.attrib.get('src', '')
+            if src and '.vid' in src:
+                video_url = src
+                break
+        
+        # Check for source elements within video tags
+        if not video_url:
+            sources = parsed.css('video source')
+            for source in sources:
+                src = source.attrib.get('src', '')
+                if src and '.vid' in src:
+                    video_url = src
+                    break
+        
+        # Check for data attributes that might contain video URLs
+        if not video_url:
+            elements_with_data = parsed.css('[data-src], [data-video], [data-url]')
+            for element in elements_with_data:
+                for attr in ['data-src', 'data-video', 'data-url']:
+                    src = element.attrib.get(attr, '')
+                    if src and '.vid' in src:
+                        video_url = src
+                        break
+                if video_url:
+                    break
+        
+        # Look in script tags for video URLs
+        if not video_url:
+            scripts = parsed.css('script')
+            for script in scripts:
+                script_text = script.text()
+                if script_text and '.vid' in script_text:
+                    # Extract URLs that contain the post ID and .vid
+                    vid_matches = re.findall(r'["\']([^"\']*' + re.escape(post_id) + r'[^"\']*\.vid[^"\']*)["\']', script_text)
+                    if vid_matches:
+                        video_url = vid_matches[0]
+                        break
+        
+        # If still no video URL found, look for any .vid URLs in the HTML
+        if not video_url:
+            vid_matches = re.findall(r'["\']([^"\']*\.vid[^"\']*)["\']', html)
+            for match in vid_matches:
+                if post_id in match:
+                    video_url = match
+                    break
+        
+        return video_url
+        
+    except Exception as e:
+        raise e
+
+async def fetch_and_parse_pages_async(page_urls, max_tabs=5):
+    """
+    Fetch and parse multiple pages concurrently using tab-based approach
+    """
+    all_data = []
+    
+    async with AsyncStealthySession(headless=True, solve_cloudflare=True) as session:
+        # Create semaphore to limit concurrent tabs
+        semaphore = asyncio.Semaphore(max_tabs)
+        
+        # Create tasks for all pages with semaphore control
+        tasks = []
+        for url in page_urls:
+            tasks.append(fetch_single_page_with_semaphore(session, url, semaphore))
+        
+        # Execute all tasks concurrently
+        print(f"Processing {len(page_urls)} pages with {max_tabs} concurrent tabs...")
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Process results
+        for i, result in enumerate(results):
+            url = page_urls[i]
+            if isinstance(result, Exception):
+                print(f"Error fetching {url}: {result}")
+                continue
+            else:
+                all_data.extend(result)
+                print(f"Fetched {len(result)} posts from {url}")
+    
+    return all_data
+
+async def fetch_single_page_with_semaphore(session, url, semaphore):
+    """
+    Wrapper to control page fetching concurrency with semaphore
+    """
+    async with semaphore:
+        return await fetch_single_page(session, url)
+
+async def fetch_single_page(session, url):
+    """
+    Fetch and parse a single page using the existing session
+    """
+    try:
+        # Add a small delay to avoid overwhelming the server
+        await asyncio.sleep(0.2)
+        page = await session.fetch(url)
+        html = page.body
+        return parse_posts(html)
+    except Exception as e:
+        raise e
+
+def parse_posts(html_content):
+    parsed_page = Selector(html_content)
+    posts = parsed_page.css('.post_el_small .post_control')
+    data = []
+    for post in posts:
+        try:
+            a_tag = post.css_first('a.post_time')
+            if not a_tag:
+                continue
+            title = a_tag.attrib.get('title', '')
+            post_url = a_tag.attrib.get('href', '')
+            if post_url:
+                full_post_url = "https://sxyprn.com" + post_url
+            else:
+                full_post_url = ''
+            
+            time_span = post.css_first('.post_control_time span')
+            post_control_time = time_span.text.strip() if time_span else ''
+            
+            control_time_div = post.css_first('.post_control_time')
+            if control_time_div:
+                text_nodes = control_time_div.xpath('.//text()')
+                text = ''.join(text_nodes).strip()
+                if '·' in text:
+                    parts = text.split('·')
+                    if len(parts) > 1:
+                        views_part = parts[1].strip()
+                        views = views_part.split()[0] if views_part.split() else ''
+                    else:
+                        views = ''
+                else:
+                    views = ''
+            else:
+                views = ''
+            
+            data.append({
+                'title': title,
+                'post_url': full_post_url,
+                'views': views,
+                'post_control_time': post_control_time,
+                'video_url': ''
+            })
+        except Exception as e:
+            print(f"Error parsing post: {e}")
+            continue
+    return data
+
+try:
+    # Fetch the raw HTML from sxyprn.com using StealthyFetcher to bypass Cloudflare
+    page = StealthyFetcher.fetch('https://sxyprn.com/Fit18.html', headless=True, solve_cloudflare=True, network_idle=True, wait=3000)
+
+    # Get the HTML content
+    html_content = page.body
+
+    # Parse the HTML
+    parsed_page = Selector(html_content)
+
+    # Parse pagination
+    pagination_links = parsed_page.css('#center_control a')
+    page_urls = []
+    for link in pagination_links:
+        href = link.attrib.get('href')
+        if href:
+            full_url = "https://sxyprn.com/Fit18.html" + href
+            page_urls.append(full_url)
+
+    # Limit to 10 pages
+    page_urls = page_urls[:10]
+
+    # Parse current page first
+    all_data = []
+    all_data.extend(parse_posts(html_content))
+
+    # Fetch and parse other pages concurrently
+    if page_urls[1:]:  # If there are additional pages to fetch
+        additional_data = asyncio.run(fetch_and_parse_pages_async(page_urls[1:], max_tabs=3))
+        all_data.extend(additional_data)
+
+    # Get video URLs using async session for better performance
+    post_urls = [d['post_url'] for d in all_data if d['post_url']]
+    video_urls = asyncio.run(get_video_urls_async(post_urls, max_tabs=5))
+    for d in all_data:
+        d['video_url'] = video_urls.get(d['post_url'], '')
+
+    # Save to JSON
+    with open('posts_data.json', 'w', encoding='utf-8') as f:
+        json.dump(all_data, f, indent=4, ensure_ascii=False)
+
+    print(f"Extracted {len(all_data)} posts from {len(page_urls)} pages and saved to posts_data.json")
+
+except Exception as e:
+    print(f"Error: {e}")
+    print("Unable to fetch data. Please check your connection or try again later.")
