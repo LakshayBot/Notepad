@@ -1,0 +1,419 @@
+from scrapling.fetchers import AsyncStealthySession, DynamicFetcher
+from scrapling.parser import Selector
+import json
+import asyncio
+import re
+import subprocess
+import time
+import platform
+import os
+import signal
+from urllib.request import urlopen
+import json
+
+# Configuration
+BRAVE_PATH = {
+    'darwin': '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser'  # macOS
+}
+REMOTE_PORT = 9222
+USER_DATA_DIR = os.path.join(os.path.expanduser('~'), 'brave_scraper_profile')
+
+def start_brave_with_debugging():
+    """Start Brave browser with remote debugging enabled"""
+    system = platform.system().lower()
+    if system == 'darwin':
+        os_key = 'darwin'
+    elif system == 'windows':
+        os_key = 'win32'
+    elif system == 'linux':
+        os_key = 'linux'
+    else:
+        raise Exception(f"Unsupported operating system: {system}")
+    
+    brave_path = BRAVE_PATH[os_key]
+    
+    # Create user data directory if it doesn't exist
+    os.makedirs(USER_DATA_DIR, exist_ok=True)
+    
+    # Command line arguments for Brave
+    args = [
+        brave_path,
+        f'--remote-debugging-port={REMOTE_PORT}',
+        f'--user-data-dir={USER_DATA_DIR}',
+        '--no-first-run',
+        '--no-default-browser-check',
+        '--disable-extensions',  # Disable all extensions to prevent loading errors
+        '--headless'  # Run Brave in headless mode (no visible window)
+    ]
+    
+    # Start Brave browser process
+    print("Starting Brave browser with remote debugging...")
+    process = subprocess.Popen(args)
+    
+    # Wait a moment for browser to start
+    time.sleep(3)
+    
+    # Get the WebSocket debugger URL
+    try:
+        response = urlopen(f'http://localhost:{REMOTE_PORT}/json/version')
+        data = json.loads(response.read())
+        websocket_url = data['webSocketDebuggerUrl']
+        print(f"Connected to Brave at: {websocket_url}")
+        return process, websocket_url
+    except Exception as e:
+        print(f"Error connecting to Brave debugging port: {e}")
+        if process:
+            process.terminate()
+        raise
+
+def get_video_urls_with_brave(post_urls, cdp_url):
+    """Extract video source URLs using Brave browser via CDP connection"""
+    video_urls = {}
+
+    for url in post_urls:
+        # Extract post ID for logging/filters
+        m = re.search(r"/post/([a-f0-9]+)\.html", url)
+        post_id = m.group(1) if m else None
+        print(f"Processing {post_id or url} with DynamicFetcher using Brave...")
+
+        captured = []
+
+        def page_action(page):
+            # Listen to network responses and capture media-like URLs
+            def on_response(response):
+                u = response.url
+                if any(ext in u.lower() for ext in ('.vid', '.m3u8', '.mp4', '/videoplayback')):
+                    if (post_id is None) or (post_id in u):
+                        captured.append(u)
+                        print(f"Captured media URL: {u}")
+
+            page.on('response', on_response)
+
+            # Wait basic load, then try to interact with likely player elements
+            try:
+                page.wait_for_load_state('domcontentloaded', timeout=15000)
+            except Exception:
+                pass
+
+            selectors = [
+                '#player_el', 'video', '.video-player', '[data-video]', '.player',
+                '[class*="play"]', '[id*="video"]', '[id*="player"]'
+            ]
+            for sel in selectors:
+                try:
+                    el = page.query_selector(sel)
+                    if el:
+                        el.click()
+                        page.wait_for_timeout(1500)
+                        if captured:
+                            break
+                except Exception:
+                    continue
+
+            # Short grace period for late requests
+            page.wait_for_timeout(1500)
+            return page
+
+        try:
+            # Use DynamicFetcher with Brave CDP connection
+            DynamicFetcher.fetch(
+                url,
+                headless=True,  # Set to False so you can see the browser
+                cdp_url=cdp_url,  # Connect to the running Brave instance
+                network_idle=True,
+                wait=1500,
+                page_action=page_action,
+                timeout=90000,
+                disable_resources=False  # keep media allowed
+            )
+        except Exception as e:
+            print(f"Error processing {url}: {e}")
+
+        video_urls[url] = captured[0] if captured else ''
+
+    return video_urls
+
+async def fetch_and_parse_pages_async(page_urls, cdp_url, max_tabs=5):
+    """Fetch and parse multiple pages concurrently using tab-based approach"""
+    all_data = []
+    
+    # Use AsyncStealthySession without cdp_url (not supported)
+    async with AsyncStealthySession(
+        headless=True,
+        # AsyncStealthySession doesn't support cdp_url
+        # Will use its own browser instance
+    ) as session:
+        # Create semaphore to limit concurrent tabs
+        semaphore = asyncio.Semaphore(max_tabs)
+        
+        # Create tasks for all pages with semaphore control
+        tasks = []
+        for url in page_urls:
+            tasks.append(fetch_single_page_with_semaphore(session, url, semaphore))
+        
+        # Execute all tasks concurrently
+        print(f"Processing {len(page_urls)} pages with {max_tabs} concurrent tabs...")
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Process results
+        for i, result in enumerate(results):
+            url = page_urls[i]
+            if isinstance(result, Exception):
+                print(f"Error fetching {url}: {result}")
+                continue
+            else:
+                all_data.extend(result)
+                print(f"Fetched {len(result)} posts from {url}")
+    
+    return all_data
+
+async def fetch_single_page_with_semaphore(session, url, semaphore):
+    """Wrapper to control page fetching concurrency with semaphore"""
+    async with semaphore:
+        return await fetch_single_page(session, url)
+
+async def fetch_single_page(session, url):
+    """Fetch and parse a single page using the existing session"""
+    try:
+        # Add a small delay to avoid overwhelming the server
+        await asyncio.sleep(0.2)
+        
+        # Define page action for better content loading
+        async def pagination_page_action(page):
+            try:
+                await page.wait_for_load_state('networkidle', timeout=20000)
+                print(f"Page loaded: {url}")
+                
+                # Wait for content to be visible
+                for selector in ['.post_el', '.post_control', '.post-item', 'article']:
+                    try:
+                        await page.wait_for_selector(selector, timeout=5000)
+                        print(f"Found content with selector {selector} on {url}")
+                        break
+                    except Exception:
+                        continue
+            except Exception as e:
+                print(f"Error in page action for {url}: {e}")
+            
+            return page
+            
+        # Use page action to ensure content is loaded
+        page = await session.fetch(
+            url, 
+            wait=3000, 
+            page_action=pagination_page_action
+        )
+        html = page.body
+        return parse_posts(html)
+    except Exception as e:
+        print(f"Error fetching {url}: {e}")
+        raise e
+
+def parse_posts(html_content):
+    """Parse post data from HTML content with enhanced selector coverage"""
+    parsed_page = Selector(html_content)
+    
+    # Try multiple possible selectors for posts
+    posts = []
+    selectors = [
+        '.post_el_small .post_control', 
+        '.post_el',                      # Alternative post element
+        '.post-item',                    # Another possible selector
+        'article',                       # Generic article elements
+        '.video-item',                   # Video specific items
+        '[id^="post-"]'                  # Elements with ID starting with post-
+    ]
+    
+    # Try each selector until we find posts
+    for selector in selectors:
+        posts = parsed_page.css(selector)
+        if posts:
+            print(f"Found {len(posts)} posts using selector: {selector}")
+            break
+    
+    # Debug the HTML if no posts found
+    if not posts:
+        print("No posts found. Dumping page title and structure:")
+        title = parsed_page.css_first('title')
+        if title:
+            print(f"Page title: {title.text}")
+        
+        # Try to find any links that might be post links
+        all_links = parsed_page.css('a[href*="post"]')
+        print(f"Found {len(all_links)} links that might be posts")
+        
+        # Try to find Cloudflare challenge
+        if "Cloudflare" in html_content or "challenge" in html_content:
+            print("Cloudflare protection detected on page")
+    
+    data = []
+    for post in posts:
+        try:
+            # Try multiple selectors for post title/link
+            a_tag = post.css_first('a.post_time') or post.css_first('a[href*="post"]') or post.css_first('a')
+            if not a_tag:
+                continue
+                
+            title = a_tag.attrib.get('title', '') or a_tag.text or ''
+            post_url = a_tag.attrib.get('href', '')
+            
+            if post_url:
+                # Ensure URL is absolute
+                if not post_url.startswith('http'):
+                    full_post_url = "https://sxyprn.com" + post_url
+                else:
+                    full_post_url = post_url
+            else:
+                full_post_url = ''
+            
+            # Try multiple selectors for time
+            time_span = post.css_first('.post_control_time span') or post.css_first('.time') or post.css_first('.date')
+            post_control_time = time_span.text.strip() if time_span else ''
+            
+            # Try multiple selectors for views
+            views = ''
+            view_selectors = ['.post_control_time', '.views', '.stats', '.meta']
+            for sel in view_selectors:
+                div = post.css_first(sel)
+                if div:
+                    text_nodes = div.xpath('.//text()')
+                    text = ''.join(text_nodes).strip()
+                    # Look for view count patterns
+                    if '·' in text or 'views' in text.lower() or 'просм' in text:
+                        parts = re.split(r'[·•]', text)
+                        for part in parts:
+                            if 'view' in part.lower() or re.search(r'\d+\s*k?', part):
+                                views_match = re.search(r'(\d+[k,.]?\d*)', part)
+                                if views_match:
+                                    views = views_match.group(1)
+                                    break
+                    if views:
+                        break
+            
+            # Extract thumbnail if available
+            thumb = ''
+            img = post.css_first('img')
+            if img:
+                thumb = img.attrib.get('src', '')
+                if thumb and not thumb.startswith('http'):
+                    thumb = "https://sxyprn.com" + thumb
+            
+            data.append({
+                'title': title,
+                'post_url': full_post_url,
+                'views': views,
+                'post_control_time': post_control_time,
+                'thumbnail': thumb,
+                'video_url': ''
+            })
+            
+            # Log successful parse for debugging
+            print(f"Parsed post: {title[:30]}{'...' if len(title) > 30 else ''}")
+            
+        except Exception as e:
+            print(f"Error parsing post: {e}")
+            continue
+    
+    print(f"Successfully parsed {len(data)} posts")
+    return data
+
+try:
+    # Start Brave browser with remote debugging
+    brave_process, cdp_websocket_url = start_brave_with_debugging()
+    
+    # Fetch the raw HTML from sxyprn.com using DynamicFetcher with Brave CDP connection
+    print("Fetching initial page using Brave browser...")
+    
+    def initial_page_action(page):
+        # Wait longer for page to fully load and render
+        try:
+            page.wait_for_load_state('networkidle', timeout=30000)  # Wait longer for full load
+            print("Page fully loaded")
+            
+            # Check if page content is loaded
+            content = page.evaluate("() => document.documentElement.outerHTML")
+            if ".post_el" in content or ".post_control" in content:
+                print("Post elements found in page source")
+            else:
+                print("Post elements not found, waiting for dynamic content...")
+                page.wait_for_timeout(5000)  # Wait additional time for dynamic content
+                
+            # Click any "Show More" or pagination buttons if they exist
+            for selector in ['a.show-more', 'button.load-more', '.pagination a', '#load_more']:
+                try:
+                    el = page.query_selector(selector)
+                    if el:
+                        print(f"Found and clicking: {selector}")
+                        el.click()
+                        page.wait_for_timeout(3000)
+                except Exception:
+                    pass
+                    
+        except Exception as e:
+            print(f"Error in page action: {e}")
+        
+        return page
+    
+    page = DynamicFetcher.fetch(
+        'https://sxyprn.com/Family-Therapy.html',
+        headless=True,
+        cdp_url=cdp_websocket_url,  # Connect to the running Brave instance
+        timeout=90000,
+        wait=3000,  # Increased wait time
+        page_action=initial_page_action
+    )
+
+    # Get the HTML content
+    html_content = page.body
+
+    # Parse the HTML
+    parsed_page = Selector(html_content)
+
+    # Parse pagination
+    pagination_links = parsed_page.css('#center_control a')
+    page_urls = []
+    for link in pagination_links:
+        href = link.attrib.get('href')
+        if href:
+            full_url = "https://sxyprn.com" + href
+            page_urls.append(full_url)
+
+    # Limit to 10 pages
+    page_urls = page_urls[:10]
+
+    # Parse current page first
+    all_data = []
+    all_data.extend(parse_posts(html_content))
+
+    # Fetch and parse other pages concurrently
+    # Note: This will use a separate browser instance, not the Brave CDP connection
+    if page_urls[1:]:  # If there are additional pages to fetch
+        additional_data = asyncio.run(fetch_and_parse_pages_async(page_urls[1:], None, max_tabs=3))
+        all_data.extend(additional_data)
+
+    # Get video URLs using Brave browser
+    post_urls = [d['post_url'] for d in all_data if d['post_url']]
+    if post_urls:
+        print(f"Processing {len(post_urls)} video URLs with network monitoring using Brave...")
+        video_urls = get_video_urls_with_brave(post_urls, cdp_websocket_url)
+        for d in all_data:
+            d['video_url'] = video_urls.get(d['post_url'], '')
+
+    # Save to JSON
+    with open('posts_data.json', 'w', encoding='utf-8') as f:
+        json.dump(all_data, f, indent=4, ensure_ascii=False)
+
+    print(f"Extracted {len(all_data)} posts from {len(page_urls)+1} pages and saved to posts_data.json")
+
+except Exception as e:
+    print(f"Error: {e}")
+    print("Unable to fetch data. Please check your connection or try again later.")
+
+finally:
+    # Make sure to close the Brave browser process when done
+    if 'brave_process' in locals():
+        print("Shutting down Brave browser...")
+        if platform.system().lower() == 'windows':
+            brave_process.terminate()
+        else:
+            brave_process.send_signal(signal.SIGTERM)
